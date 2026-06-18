@@ -1,6 +1,7 @@
 import type {Callback, Logger, Token, TokenFilter} from '@verdaccio/types';
 
 import type {S3Config} from '../types';
+import type {S3DatabaseBackend} from './s3DatabaseBackend';
 
 import {GetObjectCommand, PutObjectCommand, HeadObjectCommand} from '@aws-sdk/client-s3';
 import type {S3Client} from '@aws-sdk/client-s3';
@@ -16,7 +17,7 @@ type LocalStorage = {
   tokens: Token[];
 };
 
-export default class S3DatabaseBucket {
+export default class S3DatabaseBucket implements S3DatabaseBackend {
   public logger: Logger;
   public config: S3Config;
   private s3: S3Client;

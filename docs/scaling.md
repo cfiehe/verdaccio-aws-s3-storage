@@ -4,12 +4,12 @@ This guide explains how to run multiple Verdaccio instances behind a load balanc
 
 ## Why it scales
 
-The plugin is **fully stateless**. Every Verdaccio instance connects to the same shared backends:
+With a shared registry-state backend the plugin is **stateless** and any instance can serve any request. Every Verdaccio instance connects to the same shared backends:
 
 - **S3** — stores package tarballs and metadata (`package.json`)
-- **DynamoDB** — stores the package list, registry secret, and auth tokens
+- **DynamoDB** _or_ **PostgreSQL** — stores the package list, registry secret, and auth tokens (selected via `database: dynamo|postgres`)
 
-No data is cached in memory or written to local disk. Any instance can serve any request.
+These backends read current state on every call, so nothing is cached in memory or written to local disk. The **bucket** backend (`database: bucket`) is the exception: it caches state in memory and is single-instance only, so it cannot be used in a scaled deployment.
 
 ```
                     ┌──────────────┐
@@ -32,6 +32,8 @@ No data is cached in memory or written to local disk. Any instance can serve any
                 └────────┘  └────────┘
 ```
 
+_(The state store is DynamoDB or PostgreSQL, depending on `database`.)_
+
 ## Concurrency safety
 
 | Operation                      | Backend                           | Concurrency behavior                                                                                           |
@@ -41,6 +43,10 @@ No data is cached in memory or written to local disk. Any instance can serve any
 | `getSecret`                    | DynamoDB `GetItem`                | First node to start generates the secret and stores it. All subsequent reads return the same value.            |
 | `saveToken` / `readTokens`     | DynamoDB `PutItem` / `Query`      | Tokens are stored per-user with a unique key. Any node can authenticate any user.                              |
 | `readTarball` / `writeTarball` | S3 `GetObject` / multipart upload | S3 handles concurrent access natively.                                                                         |
+
+The table shows the DynamoDB backend. The **postgres** backend gives the same guarantees: `add` / `remove` / `saveToken` / `deleteToken` are single-row `INSERT ... ON CONFLICT` / `DELETE` statements (atomic), `getSecret` upserts on first use, and every read reflects committed state.
+
+One caveat applies to **all** backends: `savePackage` performs a read-modify-write on the package manifest, so two concurrent publishes touching the same package can race on the manifest. If your workflow allows truly concurrent publishes of the same package, serialize them upstream — e.g. a GitLab CI `resource_group`, or routing publishes through a single path.
 
 ## Infrastructure requirements
 
@@ -55,6 +61,13 @@ No data is cached in memory or written to local disk. Any instance can serve any
 - One table shared by all instances
 - **PAY_PER_REQUEST** billing mode is recommended — it auto-scales with traffic and requires no capacity planning
 - For predictable workloads with cost optimization needs, switch to **provisioned** mode with auto-scaling enabled
+
+### Postgres
+
+- One database shared by all instances (`database: postgres`)
+- A small connection pool per instance is plenty; tune `postgres.pool.max` against your server's `max_connections` divided by the number of replicas
+- Schema: with `autoCreateSchema: true` (default) the role needs CREATE on the target schema for the first-run DDL; for a least-privilege DML-only role, pre-provision [`db/schema.sql`](../db/schema.sql) and set `autoCreateSchema: false`
+- Use a connection pooler (PgBouncer, or a managed equivalent) if the replica count is high enough to pressure `max_connections`
 
 ### Load balancer
 
@@ -172,4 +185,5 @@ Key metrics to watch:
 
 - **S3**: enable versioning on the bucket for point-in-time recovery of package data
 - **DynamoDB**: enable point-in-time recovery (PITR) for the table
+- **Postgres**: rely on your server's backup story — PITR via WAL archiving, scheduled `pg_dump`, or managed automated backups/snapshots
 - **Backups**: DynamoDB on-demand backups can be triggered via AWS CLI or scheduled via AWS Backup

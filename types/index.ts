@@ -11,7 +11,14 @@ export interface S3Config extends Config {
   secretAccessKey?: string;
   sessionToken?: string;
   proxy?: string;
-  dynamoTableName: string;
+  database?: 'bucket' | 'dynamo' | 'postgres';
+  dynamoTableName?: string;
   dynamoEndpoint?: string;
   dynamoRegion?: string;
+  postgres?: {
+    url?: string;
+    pool?: Record<string, unknown>;
+    autoCreateSchema?: boolean;
+    tablePrefix?: string;
+  };
 }

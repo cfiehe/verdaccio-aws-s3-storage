@@ -38,16 +38,27 @@ pnpm format
 ```
 src/
   index.ts              # barrel export
-  s3Database.ts         # registry database (DynamoDB)
-  s3PackageManager.ts   # package storage (S3)
+  s3Database.ts         # orchestrator: wires the S3 blob half to the selected state backend
+  resolveBackend.ts     # selects bucket | dynamo | postgres
+  s3DatabaseBackend.ts  # registry-state backend interface (the shared contract)
+  s3DatabaseBucket.ts   # state backend: single JSON object in S3 (single-instance)
+  s3DatabaseDynamo.ts   # state backend: DynamoDB
+  s3DatabasePostgres.ts # state backend: PostgreSQL
+  s3PackageManager.ts   # package storage (S3): package.json + tarballs
   s3Client.ts           # S3Client factory
   dynamoClient.ts       # DynamoDB DocumentClient factory
+  postgresClient.ts     # node-postgres Pool factory
+  postgresSchema.ts     # single source of truth for the Postgres DDL
   s3Errors.ts           # AWS error → VerdaccioError conversion
   deleteKeyPrefix.ts    # S3 prefix deletion helper
   addTrailingSlash.ts   # path utility
   setConfigValue.ts     # env var resolution
 types/
   index.ts              # S3Config interface
+scripts/
+  print-schema.ts       # generates db/schema.sql from postgresSchema.ts
+db/
+  schema.sql            # generated DDL for pre-provisioning a DML-only Postgres role
 tests/                  # unit tests (vitest 4)
 conf/                   # verdaccio config (baked into Docker image)
 ```
@@ -240,6 +251,45 @@ docker compose down
 docker compose down -v
 ```
 
+## Developing against the Postgres backend
+
+The Docker setup above uses the **dynamo** backend on LocalStack. To exercise the **postgres** backend, point the plugin at a Postgres instance and set `database: postgres`.
+
+```bash
+# Throwaway local Postgres
+docker run -d --name verdaccio-pg \
+  -e POSTGRES_PASSWORD=verdaccio -e POSTGRES_DB=verdaccio \
+  -p 5432:5432 postgres:16
+```
+
+Then configure the plugin (env-substituted; see the README config reference):
+
+```yaml
+store:
+  aws-s3-storage:
+    bucket: verdaccio-storage
+    database: postgres
+    postgres:
+      url: postgres://postgres:verdaccio@localhost:5432/verdaccio
+      # autoCreateSchema: true   # default — creates the tables on first use
+```
+
+With `autoCreateSchema: true` (the default) the tables are created on first use. To rehearse the DML-only path, pre-provision the schema and switch it off:
+
+```bash
+# Generate the DDL (bare table names; pass -- --prefix=<prefix> for a custom prefix)
+pnpm schema:print > /tmp/schema.sql
+psql postgres://postgres:verdaccio@localhost:5432/verdaccio -f /tmp/schema.sql
+# then set postgres.autoCreateSchema: false in the config
+```
+
+Inspect the state directly:
+
+```bash
+psql postgres://postgres:verdaccio@localhost:5432/verdaccio -c 'TABLE packages;'
+psql postgres://postgres:verdaccio@localhost:5432/verdaccio -c 'TABLE tokens;'
+```
+
 ## Debug logging
 
 The plugin uses the [`debug`](https://www.npmjs.com/package/debug) package. Enable it with the `DEBUG` environment variable:
@@ -254,15 +304,19 @@ DEBUG=verdaccio:plugin:aws-s3-storage:database docker compose up -d
 
 Available namespaces:
 
-| Namespace                                       | What it logs                                                  |
-| ----------------------------------------------- | ------------------------------------------------------------- |
-| `verdaccio:plugin:aws-s3-storage:database`      | DynamoDB operations (add, remove, get, tokens, secret)        |
-| `verdaccio:plugin:aws-s3-storage:package`       | S3 package operations (read, write, create, delete, tarballs) |
-| `verdaccio:plugin:aws-s3-storage:s3-client`     | S3 client initialization                                      |
-| `verdaccio:plugin:aws-s3-storage:dynamo-client` | DynamoDB client initialization                                |
-| `verdaccio:plugin:aws-s3-storage:delete-prefix` | S3 prefix deletion                                            |
-| `verdaccio:plugin:aws-s3-storage:errors`        | AWS error conversion                                          |
-| `verdaccio:plugin:aws-s3-storage:config`        | Config value resolution from env vars                         |
+| Namespace                                           | What it logs                                                  |
+| --------------------------------------------------- | ------------------------------------------------------------- |
+| `verdaccio:plugin:aws-s3-storage:database`          | Backend selection / orchestration                             |
+| `verdaccio:plugin:aws-s3-storage:database:dynamo`   | DynamoDB operations (add, remove, get, tokens, secret)        |
+| `verdaccio:plugin:aws-s3-storage:database:postgres` | Postgres operations (add, remove, get, tokens, secret)        |
+| `verdaccio:plugin:aws-s3-storage:database:bucket`   | S3 registry operations (add, remove, get, tokens, secret)     |
+| `verdaccio:plugin:aws-s3-storage:package`           | S3 package operations (read, write, create, delete, tarballs) |
+| `verdaccio:plugin:aws-s3-storage:s3-client`         | S3 client initialization                                      |
+| `verdaccio:plugin:aws-s3-storage:dynamo-client`     | DynamoDB client initialization                                |
+| `verdaccio:plugin:aws-s3-storage:postgres-client`   | Postgres pool initialization                                  |
+| `verdaccio:plugin:aws-s3-storage:delete-prefix`     | S3 prefix deletion                                            |
+| `verdaccio:plugin:aws-s3-storage:errors`            | AWS error conversion                                          |
+| `verdaccio:plugin:aws-s3-storage:config`            | Config value resolution from env vars                         |
 
 The plugin also uses Verdaccio's built-in `logger.trace` at key points. Enable it by setting `level: trace` in the verdaccio config (already set in `conf/config.yaml`).
 

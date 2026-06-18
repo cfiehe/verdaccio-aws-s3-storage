@@ -1,10 +1,12 @@
 # verdaccio-aws-s3-storage
 
-AWS S3 + DynamoDB storage plugin for [Verdaccio](https://verdaccio.org).
+S3 storage plugin for [Verdaccio](https://verdaccio.org) with a pluggable registry-state backend.
 
-Uses **S3** for package tarballs and metadata, and **DynamoDB** for the registry database (package list, secrets, tokens).
+Package tarballs and `package.json` metadata always live in **S3**. The registry state — the package index, the registry secret, and auth tokens — is held in one of three backends, selected via the `database` config key:
 
-For AWS-compatible S3 that do not include DynamoDB, you can use **S3** for the registry data as well (as in older versions of the plugin).
+- **bucket** — a single JSON object in S3. Caches state in memory; single-instance only.
+- **dynamo** — DynamoDB. Reads current state on every call; safe for horizontal scaling.
+- **postgres** — PostgreSQL. Reads current state on every call; safe for horizontal scaling without DynamoDB.
 
 Built with AWS SDK for JavaScript v3.
 
@@ -13,10 +15,11 @@ Built with AWS SDK for JavaScript v3.
 - **Node.js** >= 24
 - **Verdaccio** >= 7.x
 - **AWS S3 Bucket** — stores package tarballs and `package.json` metadata
-- **AWS DynamoDB Table (optional)** — stores the registry state (package list, secret, auth tokens)
+- **AWS DynamoDB Table (optional, `database: dynamo`)** — stores the registry state (package list, secret, auth tokens)
   - Partition key: `pk` (String)
   - Sort key: `sk` (String)
   - Billing mode: PAY_PER_REQUEST (recommended) or provisioned
+- **PostgreSQL (optional, `database: postgres`)** — stores the registry state instead of DynamoDB. Any reasonably current PostgreSQL works (developed and tested against 16). With `autoCreateSchema: true` (the default) the role needs CREATE on the target schema for the first-run DDL; for a DML-only role, pre-provision `db/schema.sql` and set `autoCreateSchema: false`.
 - **AWS Credentials** — via environment variables, IAM role, instance profile, or explicit config
 
 ### IAM Permissions
@@ -63,13 +66,37 @@ store:
     sessionToken: your-token # optional
     proxy: https://your-proxy # optional
 
-    # DynamoDB
+    # Registry-state backend (package index, secret, tokens). One of: bucket | dynamo | postgres.
+    # Tarballs and package.json always live in S3 regardless of this choice.
+    # For horizontally scaled deployments use dynamo or postgres; bucket is single-instance only.
+    database: postgres
+
+    # DynamoDB (database: dynamo)
     dynamoTableName: verdaccio-registry
     dynamoEndpoint: https://dynamodb.us-east-1.amazonaws.com # optional
     dynamoRegion: us-east-1 # optional, defaults to 'region'
-    # or
-    dynamoTableName: none
+
+    # Postgres (database: postgres)
+    postgres:
+      url: postgres://user:pass@host:5432/verdaccio # optional, falls back to PG* env vars
+      autoCreateSchema: true # optional, default true; set false for a DML-only role (pre-provision the schema, see below)
+      tablePrefix: '' # optional, default none (bare tables config/packages/tokens); a non-empty value must match ^[a-z_][a-z0-9_]*$
+      pool: # optional, passed to node-postgres verbatim
+        max: 10
 ```
+
+> The `database` key is the explicit selector. If it is omitted, the backend is
+> chosen from `dynamoTableName` (`none` → bucket, otherwise dynamo) and a
+> deprecation warning is logged. This legacy behavior will be removed in a future
+> major; set `database` explicitly.
+
+> **Pre-provisioning the Postgres schema.** With `autoCreateSchema: false` the
+> plugin never issues DDL, so the tables must exist beforehand (this lets the
+> runtime role hold DML privileges only). The committed `db/schema.sql` matches the
+> default (no prefix → tables `config`, `packages`, `tokens`); if you set a custom
+> `tablePrefix`, generate matching DDL with `pnpm schema:print -- --prefix=<prefix>`.
+> The runtime DDL and the generated file share one source of truth
+> (`src/postgresSchema.ts`), so they cannot drift.
 
 ### Environment variable substitution
 
@@ -88,6 +115,8 @@ store:
     dynamoTableName: AWS_DYNAMO_TABLE_NAME
     dynamoEndpoint: AWS_DYNAMO_ENDPOINT
     dynamoRegion: AWS_DYNAMO_REGION
+    postgres:
+      url: POSTGRES_URL
 ```
 
 ### Environment variables reference
@@ -111,6 +140,12 @@ The following environment variables are used by the Docker image and the plugin 
 | `AWS_DYNAMO_ENDPOINT`   | No       | Custom DynamoDB endpoint URL. Required for LocalStack. Omit for real AWS                          |
 | `AWS_DYNAMO_REGION`     | No       | AWS region for DynamoDB. Falls back to `AWS_DEFAULT_REGION`                                       |
 
+#### Postgres
+
+| Variable       | Required | Description                                                                                          |
+| -------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `POSTGRES_URL` | No       | libpq connection string referenced by `postgres.url`. Falls back to the standard `PG*` env variables |
+
 #### Authentication
 
 | Variable                | Required | Description                                                       |
@@ -127,11 +162,14 @@ The following environment variables are used by the Docker image and the plugin 
 
 Available debug namespaces:
 
+- `verdaccio:plugin:aws-s3-storage:database` — backend selection / orchestration
 - `verdaccio:plugin:aws-s3-storage:database:dynamo` — DynamoDB operations (add, remove, get, tokens, secret)
+- `verdaccio:plugin:aws-s3-storage:database:postgres` — Postgres operations (add, remove, get, tokens, secret)
 - `verdaccio:plugin:aws-s3-storage:database:bucket` — S3 registry operations (add, remove, get, tokens, secret)
 - `verdaccio:plugin:aws-s3-storage:package` — S3 package operations (read, write, create, delete, tarballs)
 - `verdaccio:plugin:aws-s3-storage:s3-client` — S3 client initialization
 - `verdaccio:plugin:aws-s3-storage:dynamo-client` — DynamoDB client initialization
+- `verdaccio:plugin:aws-s3-storage:postgres-client` — Postgres pool initialization
 - `verdaccio:plugin:aws-s3-storage:delete-prefix` — S3 prefix deletion
 - `verdaccio:plugin:aws-s3-storage:errors` — AWS error conversion
 - `verdaccio:plugin:aws-s3-storage:config` — config value resolution from env vars
@@ -194,7 +232,27 @@ or
                             +------------------+
 ```
 
-**S3Database** handles registry operations via DynamoDB or S3:
+or
+
+```
+                   +-----------+
+                   | Verdaccio |
+                   +-----+-----+
+                         |
+            +------------+------------+
+            |                         |
+      S3DatabasePostgres       S3PackageManager
+      (registry state)         (per-package storage)
+            |                         |
+        PostgreSQL                   S3
+   +-----------------+      +------------------+
+   | config          |      | pkg/package.json |
+   | packages        |      | pkg/tarball.tgz  |
+   | tokens          |      +------------------+
+   +-----------------+
+```
+
+**S3Database** handles registry operations via DynamoDB, Postgres, or S3:
 
 - Package list (`add`, `remove`, `get`)
 - Secret management (`getSecret`, `setSecret`)
@@ -214,6 +272,18 @@ Single-table design with partition key `pk` and sort key `sk`:
 | `CONFIG`       | `SECRET`        | Registry secret key |
 | `PACKAGE`      | `{packageName}` | Package entry       |
 | `TOKEN#{user}` | `{tokenKey}`    | Auth token          |
+
+### Postgres table schema
+
+Three tables hold the registry state. Table names are derived from `postgres.tablePrefix` (unset → the bare names below). The authoritative DDL is generated into [`db/schema.sql`](db/schema.sql) from `src/postgresSchema.ts`:
+
+| Table      | Columns                                                              | Description                                                                           |
+| ---------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `config`   | `key`, `value`                                                       | Registry secret (and any future key/value config)                                     |
+| `packages` | `name`                                                               | Hosted package index                                                                  |
+| `tokens`   | `username`, `key`, `token`, `cidr`, `readonly`, `created`, `updated` | Auth tokens (one row each; `created`/`updated` are `timestamptz`, `cidr` is `text[]`) |
+
+`created` is set once when a token is first stored and is never overwritten. `updated` (`timestamptz NOT NULL`) starts equal to `created` and is set to `now()` whenever an existing token row is re-saved, so it always reflects the last modification time.
 
 ## Development
 
@@ -285,7 +355,7 @@ Resources:
 
 ## Scaling & Production Deployment
 
-The plugin is fully stateless and supports horizontal scaling. Run multiple Verdaccio instances behind a load balancer — all instances share the same S3 bucket and DynamoDB table.
+With the **dynamo** or **postgres** backend the plugin is stateless and supports horizontal scaling: run multiple Verdaccio instances behind a load balancer, all sharing the same S3 bucket and the same DynamoDB table or Postgres database. The **bucket** backend caches registry state in memory and is single-instance only.
 
 - [Scaling guide](docs/scaling.md) — architecture, concurrency safety, ECS/Fargate, Kubernetes, monitoring, cost estimation
 - [Helm example](examples/helm/) — deploy on Kubernetes using the official Verdaccio Helm chart with IRSA support

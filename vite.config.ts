@@ -33,6 +33,9 @@ export default defineConfig({
         // Other deps
         'debug',
         'http-errors',
+        // Postgres backend (CommonJS; must stay external or its internal
+        // require('crypto') breaks the ESM bundle)
+        /^pg(\/|$)/,
       ],
     },
     outDir: 'lib',

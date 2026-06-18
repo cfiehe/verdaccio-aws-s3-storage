@@ -1,6 +1,7 @@
 import type {Callback, Logger, Token, TokenFilter} from '@verdaccio/types';
 
 import type {S3Config} from '../types';
+import type {S3DatabaseBackend} from './s3DatabaseBackend';
 import {createDynamoClient} from './dynamoClient';
 
 import type {S3Client} from '@aws-sdk/client-s3';
@@ -10,7 +11,7 @@ import debugCore from 'debug';
 
 const debug = debugCore('verdaccio:plugin:aws-s3-storage:database:dynamo');
 
-export default class S3DatabaseDynamo {
+export default class S3DatabaseDynamo implements S3DatabaseBackend {
   public logger: Logger;
   public config: S3Config;
   private s3: S3Client;
@@ -23,7 +24,8 @@ export default class S3DatabaseDynamo {
     this.s3 = s3;
 
     this.dynamo = createDynamoClient(this.config);
-    this.tableName = this.config.dynamoTableName;
+    // Guaranteed present: the dynamo backend is only selected when dynamoTableName is set.
+    this.tableName = this.config.dynamoTableName!;
   }
 
   public async init(): Promise<void> {

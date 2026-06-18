@@ -3,9 +3,12 @@ import type {Callback, Config, Logger, Token, TokenFilter} from '@verdaccio/type
 
 import type {S3Config} from '../types';
 import addTrailingSlash from './addTrailingSlash';
+import resolveBackend from './resolveBackend';
 import {createS3Client} from './s3Client';
+import type {S3DatabaseBackend} from './s3DatabaseBackend';
 import S3DatabaseBucket from './s3DatabaseBucket';
 import S3DatabaseDynamo from './s3DatabaseDynamo';
+import S3DatabasePostgres from './s3DatabasePostgres';
 import S3PackageManager from './s3PackageManager';
 import setConfigValue from './setConfigValue';
 
@@ -18,7 +21,7 @@ export default class S3Database {
   public logger: Logger;
   public config: S3Config;
   private s3: S3Client;
-  private database: S3DatabaseBucket | S3DatabaseDynamo;
+  private database: S3DatabaseBackend;
 
   public constructor(config: Config, options: {logger: Logger; config: Config}) {
     this.logger = options.logger;
@@ -33,10 +36,6 @@ export default class S3Database {
       throw new Error('s3 storage requires a bucket');
     }
 
-    if (!this.config.dynamoTableName) {
-      throw new Error('s3 storage requires a dynamoTableName');
-    }
-
     this.config.bucket = setConfigValue(this.config.bucket);
     this.config.keyPrefix = setConfigValue(this.config.keyPrefix);
     this.config.endpoint = setConfigValue(this.config.endpoint);
@@ -48,6 +47,7 @@ export default class S3Database {
     this.config.dynamoTableName = setConfigValue(this.config.dynamoTableName);
     this.config.dynamoEndpoint = setConfigValue(this.config.dynamoEndpoint);
     this.config.dynamoRegion = setConfigValue(this.config.dynamoRegion);
+    this.config.database = setConfigValue(this.config.database) as S3Config['database'];
 
     const configKeyPrefix = this.config.keyPrefix;
     this.config.keyPrefix = addTrailingSlash(configKeyPrefix);
@@ -71,10 +71,18 @@ export default class S3Database {
 
     this.s3 = createS3Client(this.config);
 
-    if (this.config.dynamoTableName === 'none') {
-      this.database = new S3DatabaseBucket(this.config, this.logger, this.s3);
-    } else {
-      this.database = new S3DatabaseDynamo(this.config, this.logger, this.s3);
+    const backend = resolveBackend(this.config, this.logger);
+    debug('selected database backend=%o', backend);
+    switch (backend) {
+      case 'bucket':
+        this.database = new S3DatabaseBucket(this.config, this.logger, this.s3);
+        break;
+      case 'dynamo':
+        this.database = new S3DatabaseDynamo(this.config, this.logger, this.s3);
+        break;
+      case 'postgres':
+        this.database = new S3DatabasePostgres(this.config, this.logger);
+        break;
     }
   }
 
@@ -102,11 +110,7 @@ export default class S3Database {
     this.database.get(callback);
   }
 
-  /**
-   * Search packages. Verdaccio 6/7 calls this with callback pattern: search(onPackage, onEnd).
-   * Newer versions may call with search(query): Promise<SearchItem[]>.
-   * We support both signatures.
-   */
+  /** Delegates to the active backend; both the callback and promise search signatures are supported. */
   public search(...args) {
     return this.database.search(...args);
   }
